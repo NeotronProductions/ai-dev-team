@@ -56,6 +56,7 @@ The `main.py` script will:
 ## 📚 Documentation
 
 - **[QUICKSTART.md](docs/QUICKSTART.md)** - Quick setup guide
+- **[README.md](docs/README.md)** - Full documentation index
 - **[TERMINAL_COMMANDS.md](docs/TERMINAL_COMMANDS.md)** - Terminal command reference ⭐
 - **[USER_STORY_PROCESSING.md](docs/USER_STORY_PROCESSING.md)** - Processing user stories with sub-tasks ⭐
 - **[OUTPUT_EXPORT.md](docs/OUTPUT_EXPORT.md)** - Where outputs are saved and how to export ⭐
