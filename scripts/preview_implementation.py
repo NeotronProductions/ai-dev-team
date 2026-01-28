@@ -45,7 +45,9 @@ def get_latest_issue() -> Optional[int]:
 
 def get_issue_files(issue_number: int) -> Tuple[Path, Path]:
     """Get paths to patch file and implementation plan"""
-    patch_file = WORK_DIR / "crewai_patch.diff"
+    issue_patch = WORK_DIR / "patches" / f"issue_{issue_number}.diff"
+    legacy_patch = WORK_DIR / "crewai_patch.diff"
+    patch_file = issue_patch if issue_patch.exists() else legacy_patch
     plan_file = WORK_DIR / "implementations" / f"issue_{issue_number}_plan.md"
     return patch_file, plan_file
 
@@ -139,7 +141,15 @@ def get_diff_preview(work_dir: Path, max_lines: int = 100) -> str:
     
     # If no diff, check if patch file exists and show it
     if not diff:
-        patch_file = work_dir / "crewai_patch.diff"
+        # Prefer per-issue/latest patches under patches/, fallback to legacy crewai_patch.diff
+        patches_dir = work_dir / "patches"
+        patch_file = patches_dir / "latest.diff"
+        if not patch_file.exists() and patches_dir.exists():
+            candidates = sorted(patches_dir.glob("*.diff"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                patch_file = candidates[0]
+        if not patch_file.exists():
+            patch_file = work_dir / "crewai_patch.diff"
         if patch_file.exists():
             try:
                 with open(patch_file, 'r') as f:
@@ -314,7 +324,11 @@ def print_preview(issue_number: int, work_dir: Path):
                 print(f"   ⚠️  {message}")
                 print(f"   💡 To apply manually:")
                 print(f"      cd {work_dir}")
-                print(f"      git apply --whitespace=fix crewai_patch.diff")
+                try:
+                    rel_patch = patch_file.relative_to(work_dir)
+                except Exception:
+                    rel_patch = patch_file.name
+                print(f"      git apply --whitespace=fix {rel_patch}")
         else:
             print("   ✅ Changes already detected in repository")
     else:

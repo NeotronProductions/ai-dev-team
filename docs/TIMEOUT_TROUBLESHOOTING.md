@@ -1,5 +1,23 @@
 # Timeout Troubleshooting Guide
 
+## Error: telemetry.crewai.com Connection Timeout
+
+If you see:
+```
+HTTPSConnectionPool(host='telemetry.crewai.com', port=4319): Max retries exceeded ...
+Connection to telemetry.crewai.com timed out. (connect timeout=30)
+```
+
+CrewAI sends telemetry by default; when that endpoint is unreachable (firewall, network, or offline), it can cause a 30-second timeout.
+
+**Fix:** The project scripts now disable OpenTelemetry by default. You can also set in `.env`:
+```bash
+OTEL_SDK_DISABLED=true
+```
+Or use CrewAI’s own flag: `CREWAI_DISABLE_TELEMETRY=true`.
+
+---
+
 ## Error: Ollama Timeout After 600 Seconds
 
 If you see this error:

@@ -33,8 +33,10 @@ def print_issue_status(issue_number: int, work_dir: Path, warnings: list[str], i
         else:
             local_warnings.append(warning)
     
-    # Check local implementation status
-    patch_file = work_dir / "crewai_patch.diff"
+    # Check local implementation status (per-issue preferred, legacy fallback)
+    issue_patch = work_dir / "patches" / f"issue_{issue_number}.diff"
+    legacy_patch = work_dir / "crewai_patch.diff"
+    patch_file = issue_patch if issue_patch.exists() else legacy_patch
     plan_file = work_dir / "implementations" / f"issue_{issue_number}_plan.md"
     patch_applied = has_changes(work_dir) if (work_dir / ".git").exists() else False
     
@@ -100,7 +102,11 @@ def print_issue_status(issue_number: int, work_dir: Path, warnings: list[str], i
         print(f"   Patch file: {patch_file}")
         print(f"   To apply manually:")
         print(f"      cd {work_dir}")
-        print(f"      git apply --whitespace=fix crewai_patch.diff")
+        try:
+            rel_patch = patch_file.relative_to(work_dir)
+        except Exception:
+            rel_patch = patch_file.name
+        print(f"      git apply --whitespace=fix {rel_patch}")
     else:
         print(f"ℹ️  Implementation plan generated (no patch file)")
     

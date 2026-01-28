@@ -12,6 +12,9 @@ from crewai import Agent, Task, Crew, LLM
 
 load_dotenv()
 
+# Disable CrewAI telemetry to avoid connection timeouts to telemetry.crewai.com
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 if not GITHUB_TOKEN:
     print("❌ Error: GITHUB_TOKEN not found in .env file")

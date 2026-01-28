@@ -321,8 +321,14 @@ def create_branch_and_commit(issue_number: int, work_dir: Path, repo_name: str =
         for line in status_lines:
             if line.strip():
                 file_path = line[3:].strip()
-                if not file_path.endswith('crewai_patch.diff') and not file_path.endswith('_patch.diff'):
-                    files_to_commit.append(file_path)
+                # Exclude patch artifacts (legacy + per-issue patches/)
+                if (
+                    file_path == "crewai_patch.diff"
+                    or file_path.endswith("_patch.diff")
+                    or file_path.startswith("patches/")
+                ):
+                    continue
+                files_to_commit.append(file_path)
         
         if not files_to_commit:
             print("⚠ No source files to commit (only patch artifacts/plans or no changes)")

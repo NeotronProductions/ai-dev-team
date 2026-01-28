@@ -1,98 +1,174 @@
 # AI Dev Team
 
-An automated development team powered by CrewAI that can process GitHub issues, analyze codebases, and implement solutions.
+An automated, multi-agent development workflow powered by **CrewAI**. It can connect to GitHub, analyze issues + repository context, and (optionally) apply changes in a local checkout of a target project.
 
-## 📁 Project Structure
+- **Docs index**: `docs/README.md`
+- **Quick start**: `docs/QUICKSTART.md`
+- **Reference implementation target**: [NeotronProductions/Beautiful-Timetracker-App](https://github.com/NeotronProductions/Beautiful-Timetracker-App)
+
+---
+
+## What this repo is (and isn’t)
+
+- **This repo**: the runner/orchestrator (scripts + helpers) that talks to GitHub and coordinates agents.
+- **Not this repo**: the app you are changing. For implementation runs you’ll typically clone a *separate* target repo locally (example target: `~/dev/Beautiful-Timetracker-App`).
+
+---
+
+## Project structure
 
 ```
 ai-dev-team/
-├── docs/              # Documentation files
-├── scripts/           # Python and shell scripts
-├── data/              # Data files (JSON, etc.)
-├── config/            # Configuration files
-├── runs/              # Execution runs and outputs
-├── templates/         # Template files
-└── README.md          # This file
+├── crew_runner/          # Refactored core modules (schema, safety, git ops, etc.)
+├── docs/                 # Documentation
+├── presentation/         # Slides / infographic
+├── scripts/              # Entrypoints and utilities
+└── tests/                # Unit tests for safety/patch logic
 ```
 
-## 🚀 Quick Start
+---
 
-See [docs/QUICKSTART.md](docs/QUICKSTART.md) for detailed setup instructions.
+## Setup
 
-### One-command setup & run
+### Prerequisites
 
-After creating your virtual environment and installing dependencies:
+- **Python**: 3.10+ recommended
+- **Git**: required for the *target repo* you plan to modify
+- **GitHub token**: classic PAT with `repo` and `read:org` scopes (for private repos / orgs)
+- **LLM (choose one)**:
+  - **Ollama (local)**: recommended for “no-OpenAI” flows
+  - **OpenAI API key**: optional, used when you force OpenAI or use scripts that depend on it
+
+### Create a virtualenv and install dependencies
+
+This project doesn’t currently ship a `requirements.txt`, so install dependencies directly:
 
 ```bash
 cd ~/ai-dev-team
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -U pip
+
+# Core
+pip install crewai crewai-tools python-dotenv PyGithub requests pydantic
+
+# Dashboard (optional)
+pip install streamlit
+
+# Composio (optional, advanced GitHub actions)
+pip install composio-core composio-openai
+```
+
+### Configure `.env`
+
+Run the interactive setup script (expects `.venv` to exist):
+
+```bash
+cd ~/ai-dev-team
+./scripts/setup_github_integration.sh
+```
+
+Minimum `.env`:
+
+```env
+GITHUB_TOKEN=ghp_...
+GITHUB_REPO=owner/repo
+```
+
+Optional `.env` keys used by some scripts:
+
+```env
+OPENAI_API_KEY=sk-...
+FORCE_OPENAI=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5-coder:3b
+OLLAMA_TIMEOUT=1200
+```
+
+---
+
+## Run it
+
+### 1) Interactive initializer (good first run)
+
+```bash
 source .venv/bin/activate
 python3 scripts/main.py
 ```
 
-The `main.py` script will:
+### 2) Analyze a single GitHub issue (simple)
 
-- **Prompt for** your `GITHUB_TOKEN`, `GITHUB_REPO`, and optional `GITHUB_PROJECT_ID`
-- **Write them to** the `.env` file
-- **Run a simple GitHub issue analysis crew** for your repo
+- **Option A (local LLM via Ollama)**: `scripts/github_simple.py` (no OpenAI key, but requires Ollama)
 
-### Basic Setup
-
-1. **Get GitHub Token**
-   - Visit: https://github.com/settings/tokens
-   - Generate a token with `repo` and `read:org` scopes
-
-2. **Run Setup Script**
-   ```bash
-   cd ~/ai-dev-team
-   ./scripts/setup_github_integration.sh
-   ```
-
-3. **Execute an Issue**
-   ```bash
-   source .venv/bin/activate
-   python3 scripts/example_github_issue.py owner/repo 123
-   ```
-
-## 📚 Documentation
-
-- **[QUICKSTART.md](docs/QUICKSTART.md)** - Quick setup guide
-- **[README.md](docs/README.md)** - Full documentation index
-- **[TERMINAL_COMMANDS.md](docs/TERMINAL_COMMANDS.md)** - Terminal command reference ⭐
-- **[USER_STORY_PROCESSING.md](docs/USER_STORY_PROCESSING.md)** - Processing user stories with sub-tasks ⭐
-- **[OUTPUT_EXPORT.md](docs/OUTPUT_EXPORT.md)** - Where outputs are saved and how to export ⭐
-- **[DASHBOARD_GUIDE.md](docs/DASHBOARD_GUIDE.md)** - Complete dashboard usage guide
-- **[USAGE.md](docs/USAGE.md)** - Usage instructions
-- **[README_GITHUB.md](docs/README_GITHUB.md)** - Complete GitHub integration guide
-- **[CONTEXT_GUIDE.md](docs/CONTEXT_GUIDE.md)** - Project context guide
-- **[CREWAI_ORCHESTRATION.md](docs/CREWAI_ORCHESTRATION.md)** - CrewAI orchestration details
-
-## 🛠️ Scripts
-
-### Main Scripts
-- `scripts/automated_crew.py` - Automated crew for issue processing
-- `scripts/github_crew.py` - Full-featured GitHub crew
-- `scripts/example_github_issue.py` - Simple example script
-- `scripts/dashboard.py` - Streamlit dashboard
-- `scripts/dashboard_streaming.py` - Dashboard with streaming output
-- `scripts/dashboard_automated.py` - Automated dashboard
-
-### Setup Scripts
-- `scripts/setup_github_integration.sh` - GitHub integration setup
-- `scripts/start_dashboard.sh` - Start the dashboard server (see [DASHBOARD_GUIDE.md](docs/DASHBOARD_GUIDE.md))
-
-### Test Scripts
-- `scripts/test_*.py` - Various test scripts
-
-## 🔧 Configuration
-
-Create a `.env` file in the project root:
-
-```env
-GITHUB_TOKEN=your_github_token_here
-GITHUB_REPO=owner/repo
-OPENAI_API_KEY=your_openai_key_here  # Optional
+```bash
+source .venv/bin/activate
+python3 scripts/github_simple.py owner/repo 123
 ```
 
-## 📖 More Information
+- **Option B (GitHub search tool / semantic-ish)**: `scripts/example_github_issue.py`
 
-For detailed documentation, see the [docs/](docs/) directory.
+```bash
+source .venv/bin/activate
+python3 scripts/example_github_issue.py owner/repo 123
+```
+
+### 3) Automated end-to-end processing (plan → apply → verify → git ops)
+
+`scripts/automated_crew.py` is the “full pipeline” runner.
+
+```bash
+source .venv/bin/activate
+
+# Process up to N issues (default: 5)
+python3 scripts/automated_crew.py owner/repo 3
+
+# Process a specific issue
+python3 scripts/automated_crew.py owner/repo 1 529
+
+# Force OpenAI (skip Ollama)
+python3 scripts/automated_crew.py owner/repo 1 529 --openai
+```
+
+Notes:
+- The script applies changes in a **local checkout of the target repo**.
+- By default, it uses a hard-coded work directory: `~/dev/Beautiful-Timetracker-App` (see `WORK_DIR` near the top of `scripts/automated_crew.py`).
+
+### 4) Dashboard (optional)
+
+```bash
+./scripts/start_dashboard.sh
+```
+
+By default it binds to `0.0.0.0` on port `8001` (override with `PORT=...`).
+
+---
+
+## Outputs & artifacts (where to look)
+
+- **Target repo** (the project being modified):
+  - `implementations/issue_<N>_plan.md` (implementation plan)
+  - `crewai_patch.diff` (patch / diff artifact)
+- **This repo**:
+  - Unit tests in `tests/`
+  - Most user-facing guidance in `docs/` (start at `docs/README.md`)
+
+---
+
+## Tests
+
+```bash
+source .venv/bin/activate
+python -m unittest -v
+```
+
+---
+
+## Status
+
+This is an active experiment; expect breaking changes as the workflow evolves.
+
+---
+
+## License
+
+Intended license is **MIT**, but this repo does not currently include a `LICENSE` file.

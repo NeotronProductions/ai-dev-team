@@ -5,9 +5,14 @@ This script sets up CrewAI agents to work with GitHub issues.
 """
 
 import os
+from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process
 from crewai_tools import GithubSearchTool, ComposioTool
 from composio_core import Action, App
+
+load_dotenv()
+# Disable CrewAI telemetry to avoid connection timeouts to telemetry.crewai.com
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 # Load GitHub token from environment
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")

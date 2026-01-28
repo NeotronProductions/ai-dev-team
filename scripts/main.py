@@ -11,9 +11,12 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+# Disable CrewAI telemetry before importing crewai (avoids connection timeout to telemetry.crewai.com)
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
 from crewai import Agent, Task, Crew
 from crewai_tools import GithubSearchTool
-
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"

@@ -16,7 +16,7 @@ from github import Github
 from github.Auth import Token
 from crewai import Agent, Task, Crew, LLM
 from crewai.tools.base_tool import BaseTool
-from typing import Type, Optional
+from typing import Type, Optional, Tuple
 from pydantic import BaseModel, Field
 import json
 
@@ -38,9 +38,13 @@ from crew_runner.github_ops import (
     mark_issue_processed, create_pr, move_issue_in_project
 )
 from crew_runner.logging_utils import print_issue_status
+from crew_runner.issue_requirements import extract_requirements, check_requirements_satisfied
 
 # Load environment variables first
 load_dotenv()
+
+# Disable CrewAI/OpenTelemetry telemetry to avoid connection timeouts to telemetry.crewai.com
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 # Ensure OPENAI_API_KEY is in environment if it exists in .env
 openai_key = os.getenv("OPENAI_API_KEY")
@@ -109,7 +113,7 @@ def run_tests_after_patch(work_dir: Path, issue_number: int, crew_result) -> str
     print("="*70)
     
     # Get the tester agent with tool configured for this work_dir
-    _, _, _, _, tester_base = create_implementation_crew()
+    _, _, _, _, _, tester_base = create_implementation_crew()
     
     # Create tester agent with tool configured for the specific work_dir
     execute_tool = create_execute_command_tool(work_dir)
@@ -506,10 +510,10 @@ def create_implementation_crew():
         verbose=True,
     )
     
-    # Developer Agent - aligned with run_autopr.py
+    # Developer Agent - produces structured changes (no diffs)
     developer = Agent(
         role="Developer",
-        goal="Produce a single unified diff patch implementing the issue",
+        goal="Implement the issue by outputting structured JSON file changes",
         backstory="You write production-grade code and include tests when possible.",
         llm=llm_model,
         verbose=True,
@@ -520,6 +524,15 @@ def create_implementation_crew():
         role="Code Reviewer",
         goal="Catch bugs/security issues; ensure edge cases and quality",
         backstory="You are strict but practical; you request changes if needed.",
+        llm=llm_model,
+        verbose=True,
+    )
+
+    # Context Auditor Agent - must cite exact identifiers from loaded context
+    auditor = Agent(
+        role="Context Auditor",
+        goal="Verify the loaded repo context and cite exact IDs/selectors/functions before implementation",
+        backstory="You are strict about grounding: you only cite identifiers that appear in the provided code context and manifest.",
         llm=llm_model,
         verbose=True,
     )
@@ -541,143 +554,146 @@ def create_implementation_crew():
         allow_delegation=False,
     )
     
-    return product, architect, developer, reviewer, tester
+    return product, architect, developer, reviewer, auditor, tester
 
-def get_project_context(work_dir: Path) -> str:
-    """Gather project context from repository files"""
-    context_parts = []
-    
-    # 1. Read README if exists
-    readme_path = work_dir / "README.md"
-    if readme_path.exists():
-        try:
-            readme_content = readme_path.read_text(encoding='utf-8')[:2000]  # First 2000 chars
-            context_parts.append(f"## Project README\n{readme_content}\n")
-        except:
-            pass
-    
-    # 2. Check for package.json (Node.js/JavaScript projects)
-    package_json = work_dir / "package.json"
-    if package_json.exists():
-        try:
-            pkg = json.loads(package_json.read_text())
-            context_parts.append("## Tech Stack (from package.json)\n")
-            context_parts.append(f"- **Project Name**: {pkg.get('name', 'Unknown')}\n")
-            context_parts.append(f"- **Description**: {pkg.get('description', 'N/A')}\n")
-            if pkg.get('dependencies'):
-                deps = list(pkg['dependencies'].keys())[:10]  # Top 10
-                context_parts.append(f"- **Dependencies**: {', '.join(deps)}\n")
-            if pkg.get('devDependencies'):
-                dev_deps = list(pkg['devDependencies'].keys())[:10]
-                context_parts.append(f"- **Dev Dependencies**: {', '.join(dev_deps)}\n")
-            context_parts.append("\n")
-        except:
-            pass
-    
-    # 3. Check for requirements.txt (Python projects)
-    requirements = work_dir / "requirements.txt"
-    if requirements.exists():
-        try:
-            reqs = requirements.read_text(encoding='utf-8')[:1000]
-            context_parts.append("## Python Dependencies\n")
-            context_parts.append(f"```\n{reqs}\n```\n\n")
-        except:
-            pass
-    
-    # 3.5. Read PROJECT_CONTEXT.md if exists (detailed project context)
-    # Limit to 10000 chars to avoid token limit errors (approx 2500 tokens)
-    project_context_path = work_dir / "PROJECT_CONTEXT.md"
-    if project_context_path.exists():
-        try:
-            project_context_content = project_context_path.read_text(encoding='utf-8')
-            # Limit size to prevent token limit errors
-            if len(project_context_content) > 10000:
-                project_context_content = project_context_content[:10000] + "\n\n[... PROJECT_CONTEXT.md truncated to prevent token limit errors ...]"
-            context_parts.append(f"## Detailed Project Context\n{project_context_content}\n")
-        except:
-            pass
-    
-    # 4. Check project structure and read sample code files
-    try:
-        files = list(work_dir.iterdir())
-        file_types = {}
-        for f in files:
-            if f.is_file():
-                ext = f.suffix
-                file_types[ext] = file_types.get(ext, 0) + 1
-        
-        if file_types:
-            context_parts.append("## Project Structure\n")
-            context_parts.append(f"- **File types found**: {', '.join(sorted(file_types.keys()))}\n")
-            
-            # Check for common directories
-            common_dirs = ['src', 'lib', 'app', 'components', 'public', 'static', 'templates', 'tests', 'test', 'js', 'css']
-            found_dirs = [d for d in common_dirs if (work_dir / d).exists()]
-            if found_dirs:
-                context_parts.append(f"- **Key directories**: {', '.join(found_dirs)}\n")
-            context_parts.append("\n")
-        
-        # 4.5. Read sample code files to understand patterns (for vanilla JS/HTML/CSS projects)
-        # Look for main entry points and key modules
-        sample_files = []
-        if (work_dir / "index.html").exists():
-            sample_files.append(("index.html", work_dir / "index.html"))
-        
-        # Look in js/ directory for main modules
-        js_dir = work_dir / "js"
-        if js_dir.exists() and js_dir.is_dir():
-            for js_file in list(js_dir.glob("*.js"))[:3]:  # First 3 JS files
-                sample_files.append((f"js/{js_file.name}", js_file))
-        
-        # Look in css/ directory for stylesheets
-        css_dir = work_dir / "css"
-        if css_dir.exists() and css_dir.is_dir():
-            for css_file in list(css_dir.glob("*.css"))[:2]:  # First 2 CSS files
-                sample_files.append((f"css/{css_file.name}", css_file))
-        
-        # Read and include sample code (limited to avoid token limits)
-        # Reduced from 5 files to 3 files, and from 1500 to 1000 chars per file
-        if sample_files:
-            context_parts.append("## Code Examples (for pattern reference)\n")
-            for file_name, file_path in sample_files[:3]:  # Max 3 files (reduced from 5)
-                try:
-                    content = file_path.read_text(encoding='utf-8')[:1000]  # First 1000 chars per file (reduced from 1500)
-                    context_parts.append(f"### {file_name}\n```\n{content}\n```\n\n")
-                except:
-                    pass
-    except:
-        pass
-    
-    # 5. Look for config files that indicate tech stack
-    config_files = {
-        'tsconfig.json': 'TypeScript',
-        'webpack.config.js': 'Webpack',
-        'vite.config.js': 'Vite',
-        'next.config.js': 'Next.js',
-        'vue.config.js': 'Vue.js',
-        'angular.json': 'Angular',
-        'Cargo.toml': 'Rust',
-        'go.mod': 'Go',
-        'pom.xml': 'Java/Maven',
-        'build.gradle': 'Java/Gradle',
-        'composer.json': 'PHP',
-        'Gemfile': 'Ruby',
+CANONICAL_UI_FILES = ("index.html", "app.js", "styles.css")
+
+
+def _read_text_file(path: Path, *, max_chars: Optional[int] = None) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars] + f"\n\n[... truncated to {max_chars} chars ...]\n"
+    return text
+
+
+def _file_manifest_entry(rel_path: str, content: str, required: bool) -> dict:
+    return {
+        "path": rel_path,
+        "required": required,
+        "chars": len(content),
+        "bytes_utf8": len(content.encode("utf-8", errors="replace")),
+        "empty": len(content.strip()) == 0,
     }
-    
-    found_tech = []
-    for config_file, tech in config_files.items():
-        if (work_dir / config_file).exists():
-            found_tech.append(tech)
-    
-    if found_tech:
-        context_parts.append("## Detected Technologies\n")
-        context_parts.append(f"- {', '.join(found_tech)}\n\n")
-    
-    # Combine all context
-    if context_parts:
-        return "\n".join(context_parts)
-    else:
-        return "## Project Context\nNo specific project context detected. Assume standard project layout.\n\n"
+
+
+def _extract_keyword_snippets(text: str, *, keywords: list[str], window: int = 8, max_blocks: int = 25) -> str:
+    """
+    Extract line-numbered snippets around keyword hits. Deterministic and token-friendly.
+    """
+    lines = text.splitlines()
+    hits: list[int] = []
+    lowered = [ln.lower() for ln in lines]
+    for idx, ln in enumerate(lowered):
+        if any(k in ln for k in keywords):
+            hits.append(idx)
+    # Deduplicate/compact hits by window
+    blocks: list[tuple[int, int]] = []
+    for h in hits:
+        start = max(0, h - window)
+        end = min(len(lines), h + window + 1)
+        if blocks and start <= blocks[-1][1]:
+            blocks[-1] = (blocks[-1][0], max(blocks[-1][1], end))
+        else:
+            blocks.append((start, end))
+        if len(blocks) >= max_blocks:
+            break
+    out = []
+    for start, end in blocks:
+        out.append(f"[lines {start+1}-{end}]")
+        for i in range(start, end):
+            out.append(f"{i+1:>5} | {lines[i]}")
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def get_project_context_bundle(work_dir: Path) -> Tuple[str, list[dict], list[str]]:
+    """
+    Deterministic project context + manifest.
+
+    Returns: (context_text, manifest_entries, fatal_errors)
+    - Aborts the run if any canonical UI file is missing or empty.
+    """
+    work_dir = work_dir.resolve()
+    manifest: list[dict] = []
+    fatal_errors: list[str] = []
+    parts: list[str] = []
+
+    # Canonical UI files (required)
+    for rel in CANONICAL_UI_FILES:
+        p = work_dir / rel
+        if not p.exists():
+            fatal_errors.append(f"Required file missing: {rel}")
+            continue
+        content = _read_text_file(p, max_chars=None)
+        manifest.append(_file_manifest_entry(rel, content, required=True))
+        if len(content.strip()) == 0:
+            fatal_errors.append(f"Required file is empty: {rel}")
+            continue
+        if rel == "index.html":
+            parts.append("## Canonical UI: index.html (FULL)\n")
+            parts.append(f"```html\n{content}\n```\n")
+        elif rel == "app.js":
+            parts.append("## Canonical UI: app.js (EXCERPTS)\n")
+            parts.append("### app.js excerpt: first 220 lines\n")
+            head = "\n".join(content.splitlines()[:220])
+            parts.append(f"```javascript\n{head}\n```\n")
+            parts.append("### app.js keyword snippets\n")
+            snippets = _extract_keyword_snippets(
+                content,
+                keywords=["session", "edit", "modal", "dialog", "duration", "toast", "undo", "start", "end"],
+                window=10,
+                max_blocks=30,
+            )
+            if snippets:
+                parts.append(f"```text\n{snippets}\n```\n")
+        elif rel == "styles.css":
+            parts.append("## Canonical UI: styles.css (EXCERPTS)\n")
+            parts.append("### styles.css excerpt: first 260 lines\n")
+            head = "\n".join(content.splitlines()[:260])
+            parts.append(f"```css\n{head}\n```\n")
+            parts.append("### styles.css keyword snippets\n")
+            snippets = _extract_keyword_snippets(
+                content,
+                keywords=["modal", "toast", "dialog", "session", "button", "error", "hidden"],
+                window=8,
+                max_blocks=20,
+            )
+            if snippets:
+                parts.append(f"```text\n{snippets}\n```\n")
+
+    # Optional but useful context files
+    optional_paths = [
+        ("docs/PROJECT_CONTEXT.md", 10000),
+        ("PROJECT_CONTEXT.md", 10000),
+        ("README.md", 2000),
+        ("server.js", 4000),
+        ("package.json", 4000),
+        ("tests/app.test.js", 4000),
+    ]
+    for rel, max_chars in optional_paths:
+        p = work_dir / rel
+        if not p.exists():
+            continue
+        try:
+            content = _read_text_file(p, max_chars=max_chars)
+        except Exception:
+            continue
+        manifest.append(_file_manifest_entry(rel, content, required=False))
+        parts.append(f"## Reference: `{rel}`\n")
+        fence = "text"
+        if rel.endswith(".md"):
+            fence = "markdown"
+        elif rel.endswith(".js"):
+            fence = "javascript"
+        elif rel.endswith(".json"):
+            fence = "json"
+        parts.append(f"```{fence}\n{content}\n```\n")
+
+    # Manifest section (always included)
+    parts.append("## Context Manifest (files loaded)\n")
+    parts.append("```json\n" + json.dumps(manifest, indent=2) + "\n```\n")
+
+    return ("\n".join(parts).strip() + "\n", manifest, fatal_errors)
 
 def process_issue(issue, repo_name, work_dir, include_sub_issues=True, enable_testing: bool = None):
     """Process a single issue through the crew - aligned with run_autopr.py workflow
@@ -705,11 +721,21 @@ def process_issue(issue, repo_name, work_dir, include_sub_issues=True, enable_te
                 print(f"   - #{sub.number}: {sub.title}")
             print()
     
-    product, architect, developer, reviewer, tester = create_implementation_crew()
+    product, architect, developer, reviewer, auditor, tester = create_implementation_crew()
     
-    # Gather project context
-    project_context = get_project_context(work_dir)
-    print("📋 Project context gathered")
+    # Gather project context (deterministic bundle + manifest)
+    resolved_work_dir = work_dir.resolve()
+    print(f"📁 Working directory (resolved): {resolved_work_dir}")
+    project_context, context_manifest, context_fatal_errors = get_project_context_bundle(resolved_work_dir)
+    if context_fatal_errors:
+        print(f"\n{'='*70}")
+        print("❌ CONTEXT GATE FAILED (required files missing/empty)")
+        print(f"{'='*70}")
+        for err in context_fatal_errors:
+            print(f"- {err}")
+        print("\nAborting before CrewAI execution to prevent guessing.")
+        raise RuntimeError("Context gate failed: required canonical files not loaded")
+    print("📋 Project context gathered (with manifest)")
     
     # Build issue text including sub-issues context
     issue_text = f"# {issue.title}\n\n{issue.body or 'No description'}".strip()
@@ -724,19 +750,63 @@ def process_issue(issue, repo_name, work_dir, include_sub_issues=True, enable_te
                 sub_issues_text += f"  {sub.body[:200]}...\n"  # First 200 chars
         issue_text += sub_issues_text
     
+    # Extract requirements (AC/DoD) from issue for checklist-driven implementation
+    requirement_list = extract_requirements(issue.body or "", issue.title or "")
+    if requirement_list:
+        print(f"📋 Extracted {len(requirement_list)} requirement(s) from issue (AC/DoD)")
+    requirements_block = (
+        "REQUIREMENTS THAT MUST BE SATISFIED (from Acceptance Criteria / Definition of Done):\n"
+        + "\n".join(f"- {r}" for r in requirement_list)
+    ) if requirement_list else ""
+    
     # Task 1: Product Manager - Convert to user story (aligned with run_autopr.py)
     product_task = Task(
         description=f"""Given this GitHub issue, write:
 1) A user story (As a ... I want ... so that ...)
 2) Acceptance criteria (bullets)
-3) Out of scope (bullets)
-4) Risks/unknowns (bullets)
+3) Definition of Done (bullets - from the issue or inferred; e.g. "Changes persisted", "Undo available via toast")
+4) Out of scope (bullets)
+5) Risks/unknowns (bullets)
 
+{f'Align your acceptance criteria and Definition of Done with these extracted requirements:\n{requirements_block}\n' if requirements_block else ''}
 Issue:
 {issue_text}
 """,
         agent=product,
-        expected_output="User story with acceptance criteria, out of scope, and risks"
+        expected_output="User story with acceptance criteria, Definition of Done, out of scope, and risks"
+    )
+
+    # Task 1.5: Context Auditor - cite exact identifiers from loaded context
+    auditor_task = Task(
+        description=f"""You are the Context Auditor. Your job is to prevent guessing.
+
+Using ONLY the PROJECT CONTEXT below (which includes a context manifest and canonical files/excerpts),
+extract and cite the exact identifiers that will be used to implement this issue.
+
+Rules:
+- Only cite IDs/selectors/function names that appear in the provided context text.
+- If a required element cannot be found in context, add it to `missing` and explain briefly.
+- Prefer the canonical UI files: `{CANONICAL_UI_FILES[0]}`, `{CANONICAL_UI_FILES[1]}`, `{CANONICAL_UI_FILES[2]}` in the repo root.
+
+Output EXACTLY one JSON object in a fenced ```json block with this shape:
+{{
+  "canonical_files_present": {{"index.html": true/false, "app.js": true/false, "styles.css": true/false}},
+  "dom_ids": ["#edit-dialog", "..."],
+  "dom_classes_or_attrs": [".session-edit-button", "[data-session-id]", "..."],
+  "css_selectors": [".modal", "#toast", "..."],
+  "js_functions_or_anchors": ["openEditModal", "renderSessions", "..."],
+  "evidence": [{{"file": "index.html|app.js|styles.css|other", "quote": "exact line(s) from context"}}],
+  "missing": ["what is missing (if any)"]
+}}
+
+{f"Requirements (must be supported by cited identifiers where applicable):\n{requirements_block}\n" if requirements_block else ""}
+
+PROJECT CONTEXT:
+{project_context}
+""",
+        agent=auditor,
+        context=[product_task],
+        expected_output="Single JSON object describing cited identifiers, evidence, and any missing items."
     )
     
     # Task 2: Architect - Create technical plan (aligned with run_autopr.py)
@@ -746,23 +816,32 @@ Issue:
 - Files to change (bullets)
 - Any new functions/classes/modules
 - Test approach
+- For EACH requirement below, state the concrete implementation step(s) or file/function that satisfies it (AC/DoD mapping).
 
 Keep it concise and repo-appropriate.
 
+CANONICAL SOURCE OF TRUTH (IMPORTANT):
+- The canonical UI files are `{CANONICAL_UI_FILES[0]}`, `{CANONICAL_UI_FILES[1]}`, `{CANONICAL_UI_FILES[2]}` in the repo root (work_dir).
+- Do NOT propose edits in other paths (e.g. public/, src/, etc.) unless they exist AND are explicitly listed in \"ALLOWED PATHS\" later.
+
+{f'{requirements_block}\n' if requirements_block else ''}
 PROJECT CONTEXT:
 {project_context}
 
 Working directory: {work_dir}
 """,
         agent=architect,
-        context=[product_task],
-        expected_output="Minimal technical plan with files to change and test approach"
+        context=[product_task, auditor_task],
+        expected_output="Minimal technical plan with files to change, test approach, and mapping from each requirement to implementation"
     )
     
     # A) Get repo file allowlist for repo-scoped prompting
+    # Always include canonical UI files first to avoid "guessing" wrong targets.
     repo_files = get_repo_file_allowlist(work_dir)
-    allowed_paths_list = sorted([f for f in repo_files if not f.startswith('test')])[:20]  # Top 20 non-test files
-    test_files_list = sorted([f for f in repo_files if 'test' in f.lower()])[:10]  # Top 10 test files
+    canonical_paths = [p for p in CANONICAL_UI_FILES if p in repo_files]
+    non_test_files = sorted([f for f in repo_files if not f.startswith('test') and f not in canonical_paths])
+    allowed_paths_list = (canonical_paths + non_test_files)[:25]  # canonical + top N additional files
+    test_files_list = sorted([f for f in repo_files if 'test' in f.lower()])[:12]  # Top N test files
     
     # Determine repo type from project context
     repo_type = "static frontend web app"
@@ -783,6 +862,7 @@ Working directory: {work_dir}
 
 CRITICAL REPO CONSTRAINTS - MUST FOLLOW:
 - REPO TYPE: {repo_type}; NO backend; NO Node/Express/Mongoose; NO api/routes/controllers/models directories
+- CANONICAL UI FILES: `{CANONICAL_UI_FILES[0]}`, `{CANONICAL_UI_FILES[1]}`, `{CANONICAL_UI_FILES[2]}` in work_dir are the source of truth. Prefer these unless the repo clearly uses different canonical paths.
 - ALLOWED PATHS: You may ONLY modify these existing files:
   {', '.join(allowed_paths_list) if allowed_paths_list else 'No existing files found'}
 - TEST FILES: You may create new files in tests/ directory:
@@ -873,6 +953,15 @@ IMPORTANT:
 - Do NOT reference files outside the allowed paths list above
 - Do NOT create backend/API files (api/, routes/, controllers/, models/)
 
+FORBIDDEN IN OUTPUT (will cause rejection):
+- NO placeholders: "TODO", "placeholder", "Logic to ...", "TBD", "replace_me", "fill in"
+- NO stubs: incomplete functions, empty implementations, comment-only code
+- NO new dependencies: do not introduce moment.js or other new libraries unless explicitly approved
+- All code must be production-ready and complete
+
+Your implementation MUST satisfy every requirement below. Before outputting JSON, ensure each requirement has corresponding code or a clear note where it is implemented.
+
+{f'{requirements_block}\n' if requirements_block else ''}
 PROJECT CONTEXT:
 {project_context}
 
@@ -883,29 +972,45 @@ Issue:
 {issue_text}
 """,
         agent=developer,
-        context=[architect_task],
+        context=[architect_task, auditor_task],
         expected_output="JSON object with 'changes' array containing file operations. Use upsert_* operations for functions/CSS. NO diff format."
     )
     
     # Task 4: Reviewer - Review the patch (aligned with run_autopr.py)
     review_task = Task(
-        description="""Review the patch for:
+        description=f"""You are the Reviewer and final gate.
+
+Review the proposed changes for:
 - Correctness
 - Security
 - Edge cases
 - Style and maintainability
+- Requirement coverage (Acceptance Criteria + Definition of Done)
+- Integration alignment (use existing DOM IDs/selectors; avoid inventing new canonical files/IDs)
 
-If changes are needed, describe them clearly (bullets).
+Output EXACTLY one JSON object in a fenced ```json block with this shape:
+{{
+  \"pass\": true/false,
+  \"failed_requirements\": [\"...\"],
+  \"failed_integration_checks\": [\"...\"],
+  \"notes\": \"short, actionable notes (optional)\"
+}}
+
+Rules:
+- If ANY requirement below is missing/unclear, set pass=false and list it in failed_requirements.
+- If the changes invent IDs/selectors (not present in Context Audit / manifest), set pass=false and list it in failed_integration_checks.
+
+{f'{requirements_block}\n' if requirements_block else ''}
 """,
         agent=reviewer,
-        context=[developer_task],
-        expected_output="Code review with feedback on correctness, security, edge cases, and quality"
+        context=[developer_task, auditor_task],
+        expected_output="Single JSON object (review gate) indicating pass/fail plus failures."
     )
     
     # Create crew (without tester for now - will add testing task after patch is applied)
     crew = Crew(
-        agents=[product, architect, developer, reviewer],
-        tasks=[product_task, architect_task, developer_task, review_task],
+        agents=[product, auditor, architect, developer, reviewer],
+        tasks=[product_task, auditor_task, architect_task, developer_task, review_task],
         verbose=True
     )
     
@@ -927,7 +1032,7 @@ If changes are needed, describe them clearly (bullets).
         for i, task_output in enumerate(result.tasks_output):
             print(f"  Task {i+1} output length: {len(str(task_output))} chars")
     
-    return result
+    return (result, requirement_list)
 
 def parse_structured_changes(text: str) -> dict:
     """
@@ -974,6 +1079,46 @@ def parse_structured_changes(text: str) -> dict:
         return {"error": f"Invalid JSON: {str(e)}"}
 
 
+def _extract_fenced_json_blocks(text: str) -> list[dict]:
+    """
+    Extract JSON objects from fenced ```json ... ``` blocks.
+    Best-effort: ignores blocks that aren't valid JSON objects.
+    """
+    blocks = re.findall(r"```json\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    parsed: list[dict] = []
+    for b in blocks:
+        b = b.strip()
+        if not b:
+            continue
+        try:
+            obj = json.loads(b)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            parsed.append(obj)
+    return parsed
+
+
+def parse_context_audit(text: str) -> Optional[dict]:
+    """
+    Locate the Context Auditor JSON object (if present).
+    """
+    for obj in _extract_fenced_json_blocks(text):
+        if "canonical_files_present" in obj and "missing" in obj:
+            return obj
+    return None
+
+
+def parse_review_gate(text: str) -> Optional[dict]:
+    """
+    Locate the Reviewer gate JSON object (if present).
+    """
+    for obj in _extract_fenced_json_blocks(text):
+        if "pass" in obj and "failed_requirements" in obj and "failed_integration_checks" in obj:
+            return obj
+    return None
+
+
 def get_repo_file_allowlist(work_dir: Path) -> set[str]:
     """
     Build a set of existing files in the repo (excluding build artifacts, node_modules, etc.).
@@ -1005,6 +1150,38 @@ def get_repo_file_allowlist(work_dir: Path) -> set[str]:
         print(f"⚠️  Warning: Could not build repo file allowlist: {e}")
     
     return allowlist
+
+
+_FORBIDDEN_PLACEHOLDER_SUBSTRINGS = [
+    "todo",
+    "placeholder",
+    "logic to ",
+    "tbd",
+    "replace_me",
+    "fill in",
+]
+
+_FORBIDDEN_NEW_DEP_SUBSTRINGS = [
+    "moment(",        # moment.js usage
+    "import moment",  # import moment
+    "require('moment",
+]
+
+
+def _find_forbidden_substrings(text: str) -> list[str]:
+    """
+    Returns a list of forbidden substring matches found in text (case-insensitive).
+    Deterministic gate to avoid stubs/placeholder code being applied.
+    """
+    lowered = text.lower()
+    hits: list[str] = []
+    for s in _FORBIDDEN_PLACEHOLDER_SUBSTRINGS:
+        if s in lowered:
+            hits.append(s)
+    for s in _FORBIDDEN_NEW_DEP_SUBSTRINGS:
+        if s in lowered:
+            hits.append(s)
+    return hits
 
 
 def validate_structured_changes(changes_data: dict, work_dir: Path) -> tuple[bool, list[str]]:
@@ -1089,6 +1266,14 @@ def validate_structured_changes(changes_data: dict, work_dir: Path) -> tuple[boo
                         break
                 if any(marker in content_lower for marker in diff_markers):
                     break
+
+                # Deterministic placeholder/dependency gate
+                forbidden_hits = _find_forbidden_substrings(content_field)
+                if forbidden_hits:
+                    errors.append(
+                        f"Change {i}: Forbidden placeholder/dependency text found in content ({', '.join(sorted(set(forbidden_hits)))}). "
+                        f"Do not output stubs/TODOs/placeholders or introduce new deps like moment."
+                    )
         
         # Validate operation
         # Legacy operations
@@ -2170,10 +2355,35 @@ def clean_diff(diff_text: str) -> str:
     
     return cleaned
 
-def apply_patch(cwd: Path, patch_text: str) -> Path:
+def get_issue_patch_file(work_dir: Path, issue_number: Optional[int]) -> Path:
+    """
+    Canonical per-issue patch file location inside the target repo.
+    Example: <work_dir>/patches/issue_529.diff
+    """
+    patch_dir = work_dir / "patches"
+    if issue_number is None:
+        return patch_dir / "latest.diff"
+    return patch_dir / f"issue_{issue_number}.diff"
+
+
+def sync_legacy_patch_file(work_dir: Path, patch_content: str) -> None:
+    """
+    Backward-compatible patch location expected by older scripts/docs.
+    This file is overwritten each run and should NOT be committed.
+    """
+    try:
+        (work_dir / "crewai_patch.diff").write_text(patch_content, encoding="utf-8")
+    except Exception:
+        # Best-effort only; patch is still available in patches/
+        pass
+
+
+def apply_patch(cwd: Path, patch_text: str, issue_number: Optional[int] = None) -> Path:
     """Apply a patch to the repository - aligned with run_autopr.py"""
-    patch_file = cwd / "crewai_patch.diff"
+    patch_file = get_issue_patch_file(cwd, issue_number)
+    patch_file.parent.mkdir(parents=True, exist_ok=True)
     patch_file.write_text(patch_text, encoding="utf-8")
+    sync_legacy_patch_file(cwd, patch_text)
     
     # Try to apply the patch with multiple strategies
     strategies = [
@@ -2535,15 +2745,17 @@ def has_changes(cwd: Path) -> bool:
                       cwd=cwd, text=True, capture_output=True, check=True)
     return bool(r.stdout.strip())
 
-def apply_implementation(result, issue_number, work_dir, enable_testing: bool = None):
+def apply_implementation(result, issue_number, work_dir, enable_testing: bool = None, requirement_list: list = None):
     """Apply the implementation to actual files - aligned with run_autopr.py
     
     Args:
         result: Crew execution result
         issue_number: Issue number
         work_dir: Working directory path
-        enable_testing: If True, run tests after applying changes. 
+        enable_testing: If True, run tests after applying changes.
                        If None, uses ENABLE_TESTING env var (default: True)
+        requirement_list: Optional list of requirement strings (AC/DoD) extracted from the issue.
+                         If provided, plan is checked for semantic coverage; unsatisfied items block completion.
     """
     # HARD BRANCH SAFETY GUARD: Ensure we're on a feature branch BEFORE any file writes
     feature_branch_used = None
@@ -2679,6 +2891,86 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
         import shutil
         shutil.copy(output_file, export_file)
         print(f"✓ Output also exported to: {export_file}")
+
+    # Context audit gate: if the auditor couldn't find required identifiers, abort before applying changes.
+    context_audit = parse_context_audit(result_text)
+    if context_audit and context_audit.get("missing"):
+        missing_items = {
+            "functions": [],
+            "css_selectors": [],
+            "test_files": [],
+            "required_files": [],
+            "unsatisfied_requirements": [],
+            "context_audit": context_audit,
+            "_failure_reason": "context_audit_failed",
+            "_failure_summary": f"Context audit reported missing items: {context_audit.get('missing')}",
+        }
+        print(f"\n{'='*70}")
+        print("❌ CONTEXT AUDIT GATE FAILED - Aborting implementation")
+        print(f"{'='*70}")
+        for item in context_audit.get("missing", []):
+            print(f"- {item}")
+        return {
+            "status": "incomplete",
+            "is_complete": False,
+            "files_changed": [],
+            "git_changed_files": [],
+            "patch_path": None,
+            "missing_items": missing_items,
+            "patch_content": None,
+            "coverage_passed": False,
+            "has_git_changes": False,
+            "did_commit": False,
+            "did_push": False,
+            "did_move_done": False,
+            "feature_branch": feature_branch_used,
+            "_run_state": RunState(),
+        }
+    
+    # Review gate: if reviewer marked pass=false, abort before applying changes.
+    review_gate = parse_review_gate(result_text)
+    if review_gate and not review_gate.get("pass", True):
+        failed_reqs = review_gate.get("failed_requirements", [])
+        failed_integration = review_gate.get("failed_integration_checks", [])
+        missing_items = {
+            "functions": [],
+            "css_selectors": [],
+            "test_files": [],
+            "required_files": [],
+            "unsatisfied_requirements": failed_reqs,
+            "review_gate": review_gate,
+            "_failure_reason": "review_gate_failed",
+            "_failure_summary": f"Review gate failed: {len(failed_reqs)} requirement(s), {len(failed_integration)} integration check(s)",
+        }
+        print(f"\n{'='*70}")
+        print("❌ REVIEW GATE FAILED - Aborting implementation")
+        print(f"{'='*70}")
+        if failed_reqs:
+            print("Failed requirements:")
+            for req in failed_reqs:
+                print(f"  - {req}")
+        if failed_integration:
+            print("Failed integration checks:")
+            for check in failed_integration:
+                print(f"  - {check}")
+        if review_gate.get("notes"):
+            print(f"\nNotes: {review_gate.get('notes')}")
+        return {
+            "status": "incomplete",
+            "is_complete": False,
+            "files_changed": [],
+            "git_changed_files": [],
+            "patch_path": None,
+            "missing_items": missing_items,
+            "patch_content": None,
+            "coverage_passed": False,
+            "has_git_changes": False,
+            "did_commit": False,
+            "did_push": False,
+            "did_move_done": False,
+            "feature_branch": feature_branch_used,
+            "_run_state": RunState(),
+        }
     
     # Apply structured changes (new approach - no LLM diffs)
     patch_applied = False
@@ -2734,6 +3026,30 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
                 print(f"\n✅ Successfully applied changes to {len(changed_files)} file(s):")
                 for file in changed_files:
                     print(f"   - {file}")
+
+                # Deterministic content gate: reject placeholder/stub text post-apply
+                forbidden_findings = []
+                for rel_path in changed_files:
+                    try:
+                        file_path = work_dir / rel_path
+                        if file_path.exists() and file_path.is_file():
+                            content = file_path.read_text(encoding="utf-8", errors="replace")
+                            hits = _find_forbidden_substrings(content)
+                            if hits:
+                                forbidden_findings.append(f"{rel_path}: {', '.join(sorted(set(hits)))}")
+                    except Exception:
+                        continue
+                if forbidden_findings:
+                    print(f"\n❌ FORBIDDEN PLACEHOLDER/DEPENDENCY CONTENT DETECTED (post-apply)")
+                    for finding in forbidden_findings:
+                        print(f"   - {finding}")
+                    print("   Blocking completion/commit. Fix the output to remove stubs/TODOs/placeholders and avoid new deps.")
+                    # Treat as incomplete; keep details for retry
+                    missing.setdefault("validation_errors", [])
+                    missing["validation_errors"].extend(forbidden_findings)
+                    missing["_failure_reason"] = "forbidden_content_detected"
+                    missing["_failure_summary"] = f"Forbidden placeholder/dependency content detected in {len(forbidden_findings)} file(s)."
+                    is_complete = False
                 
                 # Verify changes with git status (robust check)
                 git_changed = get_git_changed_files(work_dir)
@@ -2767,6 +3083,19 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
                     if missing["required_files"]:
                         print(f"   Missing required files: {', '.join(missing['required_files'])}")
                 
+                # Semantic check: AC/DoD requirements satisfied in plan
+                if requirement_list and output_file.exists():
+                    plan_text = output_file.read_text(encoding="utf-8")
+                    req_ok, unsatisfied = check_requirements_satisfied(requirement_list, plan_text)
+                    if not req_ok:
+                        is_complete = False
+                        missing["unsatisfied_requirements"] = unsatisfied
+                        print(f"\n❌ REQUIREMENTS CHECK FAILED - not satisfied:")
+                        for u in unsatisfied:
+                            print(f"   - {u}")
+                    else:
+                        print(f"\n✅ All {len(requirement_list)} requirement(s) satisfied in plan.")
+                
                 # CRITICAL: Only proceed if coverage passes AND git shows changes
                 # This gate prevents partial implementations from being committed
                 if not is_complete:
@@ -2783,7 +3112,8 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
                     # NOTE: Patch is generated AFTER coverage check but BEFORE commit
                     # This ensures patch reflects the final state
                     if (work_dir / ".git").exists():
-                        patch_file = work_dir / "crewai_patch.diff"
+                        patch_file = get_issue_patch_file(work_dir, issue_number)
+                        patch_file.parent.mkdir(parents=True, exist_ok=True)
                         print(f"\n📦 Generating patch using git diff...")
                         print(f"   Note: Patch file is a local artifact and will NOT be committed")
                         
@@ -2793,6 +3123,7 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
                             patch_content = patch_result
                             patch_applied = True
                             print(f"✅ Patch generated successfully: {patch_file}")
+                            sync_legacy_patch_file(work_dir, patch_content)
                             
                             # Show patch summary
                             lines_added = patch_content.count('\n+') - patch_content.count('\n+++')
@@ -2860,7 +3191,7 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
         # Fallback to legacy diff approach if structured changes failed
         if patch and (work_dir / ".git").exists():
             try:
-                patch_file = apply_patch(work_dir, patch)
+                patch_file = apply_patch(work_dir, patch, issue_number=issue_number)
                 if has_changes(work_dir):
                     print(f"✓ Changes detected in repository - patch applied successfully (legacy mode)")
                     patch_applied = True
@@ -2910,7 +3241,7 @@ def apply_implementation(result, issue_number, work_dir, enable_testing: bool = 
         "is_complete": implementation_complete,  # Boolean flag for gating
         "files_changed": changed_files if 'changed_files' in locals() else [],
         "git_changed_files": get_git_changed_files(work_dir) if (work_dir / ".git").exists() else [],
-        "patch_path": str(work_dir / "crewai_patch.diff") if 'patch_applied' in locals() and patch_applied else None,
+        "patch_path": str(get_issue_patch_file(work_dir, issue_number)) if 'patch_applied' in locals() and patch_applied else None,
         "missing_items": missing,  # B) Always include missing_items (never empty dict after failure)
         "patch_content": patch_content if 'patch_content' in locals() else None,
         "coverage_passed": run_state.coverage_ok,
@@ -2950,8 +3281,11 @@ def print_issue_status(issue_number: int, work_dir: Path, warnings: list[str], i
             # Default to local if unclear
             local_warnings.append(warning)
     
-    # Check local implementation status
-    patch_file = work_dir / "crewai_patch.diff"
+    # Check local implementation status (per-issue preferred, legacy fallback)
+    patch_file = get_issue_patch_file(work_dir, issue_number)
+    legacy_patch = work_dir / "crewai_patch.diff"
+    if not patch_file.exists() and legacy_patch.exists():
+        patch_file = legacy_patch
     plan_file = work_dir / "implementations" / f"issue_{issue_number}_plan.md"
     # C) Use implementation_status to determine if changes were actually applied
     if implementation_status:
@@ -3038,7 +3372,11 @@ def print_issue_status(issue_number: int, work_dir: Path, warnings: list[str], i
         print(f"   Patch file: {patch_file}")
         print(f"   To apply manually:")
         print(f"      cd {work_dir}")
-        print(f"      git apply --whitespace=fix crewai_patch.diff")
+        try:
+            rel_patch = patch_file.relative_to(work_dir)
+        except Exception:
+            rel_patch = patch_file.name
+        print(f"      git apply --whitespace=fix {rel_patch}")
         print(f"      # Or review and apply changes manually from the patch file")
     else:
         # C) Check if validation failed or no changes were applied
@@ -3248,7 +3586,7 @@ def run_preview_script(issue_number: int, work_dir: Path):
         # Don't fail the whole process if preview fails
         print(f"⚠️  Could not run preview script: {e} (non-critical)")
 
-def check_patch_application_status(work_dir: Path) -> tuple[bool, list[str]]:
+def check_patch_application_status(work_dir: Path, issue_number: Optional[int] = None) -> tuple[bool, list[str]]:
     """
     Check if patch was successfully applied and return status with warnings
     Returns: (patch_applied, warnings)
@@ -3263,8 +3601,11 @@ def check_patch_application_status(work_dir: Path) -> tuple[bool, list[str]]:
     if has_changes(work_dir):
         patch_applied = True
     else:
-        # No changes - check if patch file exists
-        patch_file = work_dir / "crewai_patch.diff"
+        # No changes - check if patch file exists (per-issue preferred, legacy fallback)
+        patch_file = get_issue_patch_file(work_dir, issue_number)
+        legacy_patch = work_dir / "crewai_patch.diff"
+        if not patch_file.exists() and legacy_patch.exists():
+            patch_file = legacy_patch
         if patch_file.exists():
             # Patch file exists but no changes - likely failed to apply
             warnings.append("Patch file generated but changes not applied (patch may be corrupt or incompatible with current files)")
@@ -3423,8 +3764,13 @@ def create_branch_and_commit(issue_number, work_dir, repo_name=None, issue_title
             if line.strip():
                 file_path = line[3:].strip()  # Skip status prefix
                 # Exclude patch artifacts
-                if not file_path.endswith('crewai_patch.diff') and not file_path.endswith('_patch.diff'):
-                    files_to_commit.append(file_path)
+                if (
+                    file_path == "crewai_patch.diff"
+                    or file_path.endswith("_patch.diff")
+                    or file_path.startswith("patches/")
+                ):
+                    continue
+                files_to_commit.append(file_path)
         
         if not files_to_commit:
             print("⚠ No source files to commit (only patch artifacts/plans or no changes)")
@@ -4170,7 +4516,7 @@ def run_automated_crew(repo_name, max_issues=5, issue_number=None):
                 ensure_base_branch(work_dir)
             
             # Process the issue (with sub-issues if enabled)
-            result = process_issue(issue, repo_name, work_dir, include_sub_issues=process_sub_issues, enable_testing=enable_testing)
+            result, requirement_list = process_issue(issue, repo_name, work_dir, include_sub_issues=process_sub_issues, enable_testing=enable_testing)
             
             # Save implementation plan and apply changes (with retry)
             max_retries = 2
@@ -4184,21 +4530,24 @@ def run_automated_crew(repo_name, max_issues=5, issue_number=None):
                     print(f"{'='*70}")
                     
                     # Create retry crew with fresh agents
-                    retry_product, retry_architect, retry_developer, retry_reviewer, retry_tester = create_implementation_crew()
+                    retry_product, retry_architect, retry_developer, retry_reviewer, retry_auditor, retry_tester = create_implementation_crew()
                     
                     # Guard: ensure developer agent is available
                     if retry_developer is None:
                         print(f"❌ Failed to create developer agent for retry")
                         break
                     
-                    # Create retry task with missing items
+                    # Create retry task with missing items (structural + semantic + validation)
                     missing_checklist = implementation_status.get("missing_items", {})
-                    missing_text = "\n".join([
+                    missing_parts = [
                         f"- Missing functions: {', '.join(missing_checklist.get('functions', []))}" if missing_checklist.get('functions') else "",
                         f"- Missing CSS selectors: {', '.join(missing_checklist.get('css_selectors', []))}" if missing_checklist.get('css_selectors') else "",
                         f"- Missing test files: {', '.join(missing_checklist.get('test_files', []))}" if missing_checklist.get('test_files') else "",
-                        f"- Missing required files: {', '.join(missing_checklist.get('required_files', []))}" if missing_checklist.get('required_files') else ""
-                    ])
+                        f"- Missing required files: {', '.join(missing_checklist.get('required_files', []))}" if missing_checklist.get('required_files') else "",
+                        f"- Unsatisfied requirements: {'; '.join(missing_checklist.get('unsatisfied_requirements', []))}" if missing_checklist.get('unsatisfied_requirements') else "",
+                        f"- Validation errors: {'; '.join(missing_checklist.get('validation_errors', []))}" if missing_checklist.get('validation_errors') else "",
+                    ]
+                    missing_text = "\n".join(p for p in missing_parts if p)
                     
                     # Build issue text for retry
                     issue_text_retry = f"# {issue.title}\n\n{issue.body or 'No description'}".strip()
@@ -4221,7 +4570,7 @@ Focus on the files and functions that need to be added/modified.
 {missing_text}
 
 Use the same structured JSON format with appropriate operations (upsert_function_js, upsert_css_selector, create, etc.).
-Ensure ALL missing items are addressed in this pass.
+Ensure ALL missing items are addressed in this pass. If "Unsatisfied requirements" are listed, add implementation that satisfies each one.
 
 Original issue:
 {issue_text_retry}
@@ -4240,7 +4589,7 @@ Original issue:
                     print(f"🚀 Starting retry crew execution...")
                     result = retry_crew.kickoff()
                 
-                implementation_status = apply_implementation(result, issue.number, work_dir, enable_testing=enable_testing)
+                implementation_status = apply_implementation(result, issue.number, work_dir, enable_testing=enable_testing, requirement_list=requirement_list)
                 
                 if implementation_status["status"] == "complete":
                     print(f"\n✅ Implementation completed successfully!")
@@ -4301,10 +4650,10 @@ Original issue:
                                 move_issue_in_project(repo_name, sub_issue.number, in_progress_column)
                             
                             # Process sub-issue
-                            sub_result = process_issue(sub_issue, repo_name, work_dir, include_sub_issues=False, enable_testing=enable_testing)
+                            sub_result, sub_requirement_list = process_issue(sub_issue, repo_name, work_dir, include_sub_issues=False, enable_testing=enable_testing)
                             
                             # Apply implementation
-                            sub_implementation_status = apply_implementation(sub_result, sub_issue.number, work_dir, enable_testing=enable_testing)
+                            sub_implementation_status = apply_implementation(sub_result, sub_issue.number, work_dir, enable_testing=enable_testing, requirement_list=sub_requirement_list)
                             
                             # Create branch and commit for sub-issue (ONLY if complete)
                             if sub_implementation_status and sub_implementation_status["status"] == "complete":
@@ -4342,9 +4691,12 @@ Original issue:
             warnings = []
             
             # Check if patch was applied successfully (if patch was generated)
-            patch_file = work_dir / "crewai_patch.diff"
+            patch_file = get_issue_patch_file(work_dir, issue.number)
+            legacy_patch = work_dir / "crewai_patch.diff"
+            if not patch_file.exists() and legacy_patch.exists():
+                patch_file = legacy_patch
             if patch_file.exists():
-                patch_applied, patch_warnings = check_patch_application_status(work_dir)
+                patch_applied, patch_warnings = check_patch_application_status(work_dir, issue_number=issue.number)
                 warnings.extend(patch_warnings)
                 if not patch_applied:
                     warnings.append("Patch failed to apply - review patch file manually or apply changes manually")
@@ -4406,7 +4758,7 @@ Original issue:
             enable_testing = os.getenv("ENABLE_TESTING", "true").lower() in ("true", "1", "yes")
             
             # Process the issue (with sub-issues if enabled)
-            result = process_issue(issue, repo_name, work_dir, include_sub_issues=process_sub_issues, enable_testing=enable_testing)
+            result, requirement_list = process_issue(issue, repo_name, work_dir, include_sub_issues=process_sub_issues, enable_testing=enable_testing)
             
             # Save implementation plan and apply changes (with retry)
             max_retries = 2
@@ -4420,7 +4772,7 @@ Original issue:
                     print(f"{'='*70}")
                     
                     # Create retry crew with fresh agents
-                    retry_product, retry_architect, retry_developer, retry_reviewer, retry_tester = create_implementation_crew()
+                    retry_product, retry_architect, retry_developer, retry_reviewer, retry_auditor, retry_tester = create_implementation_crew()
                     
                     # Guard: ensure developer agent is available
                     if retry_developer is None:
@@ -4457,7 +4809,7 @@ Focus on the files and functions that need to be added/modified.
 {missing_text}
 
 Use the same structured JSON format with appropriate operations (upsert_function_js, upsert_css_selector, create, etc.).
-Ensure ALL missing items are addressed in this pass.
+Ensure ALL missing items are addressed in this pass. If "Unsatisfied requirements" are listed, add implementation that satisfies each one.
 
 Original issue:
 {issue_text_retry}
@@ -4476,7 +4828,7 @@ Original issue:
                     print(f"🚀 Starting retry crew execution...")
                     result = retry_crew.kickoff()
                 
-                implementation_status = apply_implementation(result, issue.number, work_dir, enable_testing=enable_testing)
+                implementation_status = apply_implementation(result, issue.number, work_dir, enable_testing=enable_testing, requirement_list=requirement_list)
                 
                 if implementation_status["status"] == "complete":
                     print(f"\n✅ Implementation completed successfully!")
@@ -4537,10 +4889,10 @@ Original issue:
                                 move_issue_in_project(repo_name, sub_issue.number, in_progress_column)
                             
                             # Process sub-issue
-                            sub_result = process_issue(sub_issue, repo_name, work_dir, include_sub_issues=False, enable_testing=enable_testing)
+                            sub_result, sub_requirement_list = process_issue(sub_issue, repo_name, work_dir, include_sub_issues=False, enable_testing=enable_testing)
                             
                             # Apply implementation
-                            sub_implementation_status = apply_implementation(sub_result, sub_issue.number, work_dir, enable_testing=enable_testing)
+                            sub_implementation_status = apply_implementation(sub_result, sub_issue.number, work_dir, enable_testing=enable_testing, requirement_list=sub_requirement_list)
                             
                             # Create branch and commit for sub-issue (ONLY if complete)
                             if sub_implementation_status and sub_implementation_status["status"] == "complete":
@@ -4578,9 +4930,12 @@ Original issue:
             warnings = []
             
             # Check if patch was applied successfully (if patch was generated)
-            patch_file = work_dir / "crewai_patch.diff"
+            patch_file = get_issue_patch_file(work_dir, issue.number)
+            legacy_patch = work_dir / "crewai_patch.diff"
+            if not patch_file.exists() and legacy_patch.exists():
+                patch_file = legacy_patch
             if patch_file.exists():
-                patch_applied, patch_warnings = check_patch_application_status(work_dir)
+                patch_applied, patch_warnings = check_patch_application_status(work_dir, issue_number=issue.number)
                 warnings.extend(patch_warnings)
                 if not patch_applied:
                     warnings.append("Patch failed to apply - review patch file manually or apply changes manually")

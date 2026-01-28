@@ -3,6 +3,8 @@
 This folder contains all documentation for the **AI Dev Team** project.  
 Use this file as a starting point to find the right guide quickly.
 
+**Reference repository:** [NeotronProductions/Beautiful-Timetracker-App](https://github.com/NeotronProductions/Beautiful-Timetracker-App) (implementation target used in examples and scripts).
+
 ---
 
 ## 1. Getting Started

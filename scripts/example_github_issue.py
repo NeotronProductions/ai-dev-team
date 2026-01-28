@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Simple example: Execute a GitHub issue with CrewAI
+Simple example: Execute a GitHub issue with CrewAI.
+
+Usage:
+  With args:    python example_github_issue.py <repo> [issue_number]
+  Interactive:  python example_github_issue.py
+                (uses GITHUB_REPO from .env if set, then prompts for issue number)
 """
 
 import os
@@ -12,25 +17,43 @@ from crewai_tools import GithubSearchTool
 # Load environment variables
 load_dotenv()
 
+# Disable CrewAI telemetry to avoid connection timeouts to telemetry.crewai.com
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 if not GITHUB_TOKEN:
     print("❌ Error: GITHUB_TOKEN not found in .env file")
     print("   Run: ./scripts/setup_github_integration.sh")
     sys.exit(1)
 
-# Get repository from command line or environment
-if len(sys.argv) < 2:
-    print("Usage: python example_github_issue.py <repo> [issue_number]")
-    print("Example: python example_github_issue.py owner/repo 123")
-    sys.exit(1)
+# Repository: from CLI, then .env, then prompt
+if len(sys.argv) >= 2:
+    repo = sys.argv[1]
+else:
+    repo = os.getenv("GITHUB_REPO")
+    if not repo:
+        print("Repository not set. Enter your GitHub repo (format: owner/repo), or set GITHUB_REPO in .env")
+        repo = input("GitHub repo (owner/repo): ").strip()
+        if not repo:
+            print("❌ Repository required.")
+            sys.exit(1)
 
-repo = sys.argv[1]
 repo_url = f"https://github.com/{repo}"
 
-# Optional issue number
-issue_number = sys.argv[2] if len(sys.argv) > 2 else None
+# Issue number: from CLI, then interactive prompt
+if len(sys.argv) >= 3:
+    issue_number = sys.argv[2].strip() or None
+else:
+    issue_input = input(
+        f"Enter an issue number from {repo_url} (or leave empty to analyze open issues): "
+    ).strip()
+    issue_number = issue_input if issue_input else None
 
 print(f"🔍 Setting up GitHub integration for: {repo_url}")
+if issue_number:
+    print(f"   Target issue: #{issue_number}")
+else:
+    print("   Mode: analyze open issues (top 3)")
 print("")
 
 # Setup GitHub search tool
