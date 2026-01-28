@@ -3673,7 +3673,14 @@ def ensure_base_branch(work_dir):
     except Exception as e:
         print(f"⚠ Error ensuring base branch: {e}")
 
-def create_branch_and_commit(issue_number, work_dir, repo_name=None, issue_title=None, push=False) -> dict:
+def create_branch_and_commit(
+    issue_number,
+    work_dir,
+    repo_name=None,
+    issue_title=None,
+    push=False,
+    parent_issue_number: Optional[int] = None,
+) -> dict:
     """
     Create a git branch, commit changes, and optionally push and create PR.
     Returns dict with: did_commit, did_push, branch_name, commit_hash (if successful)
@@ -3717,8 +3724,11 @@ def create_branch_and_commit(issue_number, work_dir, repo_name=None, issue_title
             subprocess.run(['git', 'checkout', base_branch], check=False, capture_output=True)
             subprocess.run(['git', 'pull', '--ff-only'], check=False, capture_output=True)
         
-        # Create branch (delete if exists)
-        branch_name = f"feature/issue-{issue_number}"
+        # Create branch (delete if exists). For sub-issues, nest under parent.
+        if parent_issue_number is not None and parent_issue_number != issue_number:
+            branch_name = f"feature/issue-{parent_issue_number}-sub-{issue_number}"
+        else:
+            branch_name = f"feature/issue-{issue_number}"
         
         # Check if we're already on this branch
         if current_branch == branch_name:
@@ -4663,7 +4673,8 @@ Original issue:
                                         work_dir,
                                         repo_name=repo_name,
                                         issue_title=sub_issue.title,
-                                        push=push_to_github
+                                        push=push_to_github,
+                                        parent_issue_number=issue.number,
                                     )
                                 
                                 # Move sub-issue to "Done" (only if complete)
@@ -4902,7 +4913,8 @@ Original issue:
                                         work_dir,
                                         repo_name=repo_name,
                                         issue_title=sub_issue.title,
-                                        push=push_to_github
+                                        push=push_to_github,
+                                        parent_issue_number=issue.number,
                                     )
                                 
                                 # Move sub-issue to "Done" (only if complete)

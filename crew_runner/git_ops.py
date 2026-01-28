@@ -251,8 +251,14 @@ def ensure_base_branch(work_dir: Path):
         print(f"⚠ Error ensuring base branch: {e}")
 
 
-def create_branch_and_commit(issue_number: int, work_dir: Path, repo_name: str = None, 
-                            issue_title: str = None, push: bool = False) -> dict:
+def create_branch_and_commit(
+    issue_number: int,
+    work_dir: Path,
+    repo_name: str = None,
+    issue_title: str = None,
+    push: bool = False,
+    parent_issue_number: int | None = None,
+) -> dict:
     """
     Create a git branch, commit changes, and optionally push.
     Returns dict with: did_commit, did_push, branch_name, commit_hash (if successful)
@@ -291,8 +297,11 @@ def create_branch_and_commit(issue_number: int, work_dir: Path, repo_name: str =
             subprocess.run(['git', 'checkout', base_branch], cwd=work_dir, check=False, capture_output=True)
             subprocess.run(['git', 'pull', '--ff-only'], cwd=work_dir, check=False, capture_output=True)
         
-        # Create branch
-        branch_name = f"feature/issue-{issue_number}"
+        # Create branch (optionally nested under parent issue for sub-issues)
+        if parent_issue_number is not None and parent_issue_number != issue_number:
+            branch_name = f"feature/issue-{parent_issue_number}-sub-{issue_number}"
+        else:
+            branch_name = f"feature/issue-{issue_number}"
         
         if current_branch != branch_name:
             result = subprocess.run(['git', 'show-ref', '--verify', '--quiet', f'refs/heads/{branch_name}'],
