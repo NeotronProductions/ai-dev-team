@@ -1,0 +1,41 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+.venv/
+venv/
+ENV/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+*.egg-info/
+build/
+dist/
+
+# IDEs / editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Project outputs / local data
+runs/
+exports/
+processed_issues.json
+data/processed_issues.json
+
+# Logs
+*.log

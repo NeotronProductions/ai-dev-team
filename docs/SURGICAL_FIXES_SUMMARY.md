@@ -1,0 +1,242 @@
+# Surgical Fixes: Robust Structured Changes + Completion Gating
+
+## Files Modified
+
+1. **`/home/hempfinder/ai-dev-team/scripts/automated_crew.py`**
+   - Line ~2198: Enhanced structured change applier
+   - Line ~2671: Updated `create_branch_and_commit()` to exclude patch artifacts
+   - Added coverage gate before commit/Done operations
+   - Added self-test functions
+
+2. **`/home/hempfinder/dev/Beautiful-Timetracker-App/.gitignore`**
+   - Added patch artifact exclusions
+
+3. **`/home/hempfinder/ai-dev-team/docs/REFACTOR_STRUCTURED_CHANGES.md`**
+   - Updated with new operations and coverage gate documentation
+
+## Key Fixes
+
+### 1. Robust Structured Change Application (Line ~2198)
+
+**New Operations:**
+- `upsert_function_js` - Replace if exists, append if not
+- `upsert_css_selector` - Replace if exists, append if not
+- `insert_after_anchor` - Insert after anchor string/regex
+- `insert_before_anchor` - Insert before anchor string/regex
+- `append_if_missing` - Append only if signature not present
+
+**Fallback Behavior:**
+- Edit operations try regex if exact match fails
+- Upsert operations handle missing functions/selectors gracefully
+- No more "Could not find text to replace" failures
+
+### 2. Coverage Gate (Line ~2225)
+
+**Gate Location:** Right after applying changes, before patch generation
+
+```python
+# Check coverage before proceeding
+is_complete, missing = check_coverage(output_file, work_dir)
+
+if not is_complete:
+    # Status: incomplete
+    # DO NOT commit
+    # DO NOT move to Done
+    # Trigger retry
+```
+
+**What Gets Checked:**
+- Required functions exist in JS files
+- Required CSS selectors exist in styles.css
+- Required test files exist
+- Required files exist
+
+### 3. Git Status Verification (Line ~2213)
+
+**Fixed Reporting:**
+```python
+git_changed = get_git_changed_files(work_dir)
+# Only report "No files changed" if git shows clean tree
+```
+
+### 4. Patch Artifacts Exclusion (Line ~2756)
+
+**Updated `create_branch_and_commit()`:**
+```python
+# Filter out patch artifacts from staging
+files_to_commit = []
+for line in status_lines:
+    file_path = line[3:].strip()
+    if (not file_path.endswith('crewai_patch.diff') and 
+        not file_path.endswith('_patch.diff') and
+        not file_path.startswith('implementations/')):
+        files_to_commit.append(file_path)
+
+# Add only source files
+for file_path in files_to_commit:
+    subprocess.run(['git', 'add', file_path], ...)
+```
+
+### 5. Flow Ordering (Enforced)
+
+**Correct Order:**
+1. Apply structured changes
+2. Verify with git status
+3. **Coverage check** ← Gate here
+4. **If complete:**
+   - Generate patch (local artifact)
+   - Commit (only source files)
+   - Move to Done
+5. **If incomplete:**
+   - Show missing items
+   - Retry (if attempts remaining)
+   - **DO NOT commit**
+   - **DO NOT move to Done**
+
+### 6. Self-Tests Added
+
+**Functions:**
+- `test_upsert_function_js()` - Tests function upsert
+- `test_upsert_css_selector()` - Tests CSS selector upsert
+- `run_self_tests()` - Runs all self-tests
+
+**Run with:**
+```bash
+TEST_MODE=true python scripts/automated_crew.py
+```
+
+## Issue #529 Fix Verification
+
+### Before (Commit 8b50157)
+- ✅ HTML modal added
+- ❌ JavaScript functions missing
+- ❌ CSS styles missing
+- ❌ Test file missing
+- ⚠️  Issue marked Done anyway
+- ⚠️  Only `index.html` committed (not `app.js`, `styles.css`)
+
+### After (With New System)
+- ✅ HTML modal added
+- ❌ Coverage check fails (missing functions, CSS, tests)
+- ⚠️  Status: `incomplete`
+- 🔄 Retry pass 1: Adds missing functions via `upsert_function_js`
+- 🔄 Retry pass 2: Adds missing CSS via `upsert_css_selector`
+- ✅ Coverage check passes
+- ✅ Patch generated via git diff (local artifact, not committed)
+- ✅ Only source files committed (app.js, styles.css, index.html)
+- ✅ Issue moved to Done only when complete
+
+## New Structured Change Schema
+
+### Example for Issue #529
+
+```json
+{
+  "changes": [
+    {
+      "path": "index.html",
+      "operation": "replace_file",
+      "content": "<!DOCTYPE html>..."
+    },
+    {
+      "path": "app.js",
+      "operation": "upsert_function_js",
+      "function_name": "openEditModal",
+      "content": "function openEditModal(sessionId) { ... }"
+    },
+    {
+      "path": "app.js",
+      "operation": "upsert_function_js",
+      "function_name": "calculateDuration",
+      "content": "function calculateDuration(startTime, endTime) { ... }"
+    },
+    {
+      "path": "styles.css",
+      "operation": "upsert_css_selector",
+      "selector": ".modal",
+      "content": ".modal { display: none; ... }"
+    },
+    {
+      "path": "test/app.test.js",
+      "operation": "create",
+      "content": "// Test file content"
+    }
+  ]
+}
+```
+
+## Patch Generation
+
+### Command (Always)
+
+```bash
+git diff --no-color --minimal > crewai_patch.diff
+```
+
+### Status
+
+- ✅ Generated by git (deterministic, always valid)
+- ✅ Local artifact only (NOT committed)
+- ✅ Excluded via `.gitignore`
+- ✅ Filtered out in `git add` operations
+
+## Coverage Gate Details
+
+### Location in Code
+
+Around line **~2225** in `apply_implementation()`:
+
+```python
+# Check coverage before proceeding
+print(f"\n{'='*70}")
+print(f"🔍 COVERAGE CHECK")
+print(f"{'='*70}")
+
+is_complete, missing = check_coverage(output_file, work_dir)
+
+if is_complete:
+    print(f"✅ All plan requirements met!")
+else:
+    print(f"❌ Coverage check failed - missing items:")
+    # ... show missing items
+    # Status set to incomplete
+    # Patch generation skipped
+    # Commit skipped
+    # Done move skipped
+```
+
+### Gate Enforcement
+
+The gate is enforced in multiple places:
+
+1. **Before patch generation** (line ~2245)
+2. **Before commit** (line ~3494) - checks `implementation_status["status"] == "complete"`
+3. **Before moving to Done** (line ~3506) - checks `implementation_status["status"] == "complete"`
+
+## Verification Commands
+
+```bash
+# Verify .gitignore excludes patches
+cd /home/hempfinder/dev/Beautiful-Timetracker-App
+git check-ignore crewai_patch.diff
+# Should output: crewai_patch.diff
+
+# Run self-tests
+cd /home/hempfinder/ai-dev-team
+TEST_MODE=true python scripts/automated_crew.py
+
+# Test on issue #529
+python scripts/automated_crew.py --issue 529
+# Should show coverage check
+# Should NOT commit if incomplete
+# Should NOT move to Done if incomplete
+```
+
+## Summary
+
+✅ **Robust change application** - No more brittle exact matching  
+✅ **Coverage gate** - Prevents partial implementations  
+✅ **Patch artifacts excluded** - Not committed to repo  
+✅ **Proper flow ordering** - Apply → Verify → Gate → Commit → Done  
+✅ **Self-tests** - Validation for upsert functions  
+✅ **Documentation updated** - Reflects new behavior
